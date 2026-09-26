@@ -322,6 +322,43 @@ def rowwise_tfidf_cos(texts_q: list[str], texts_p: list[str], ckeys: np.ndarray,
     return out
 
 
+def _tfidf_transform_worker(rng):
+    s, e = rng
+    texts, idx = get_shared("texts"), get_shared("idx")
+    return get_shared("vec").transform([texts[i] for i in idx[s:e]])
+
+
+def _tfidf_cos_worker(rng):
+    s, e = rng
+    X, pl, pr = get_shared("X"), get_shared("pl"), get_shared("pr")
+    return np.asarray(X[pl[s:e]].multiply(X[pr[s:e]]).sum(axis=1)).ravel()
+
+
+def pairwise_tfidf_cos(texts: np.ndarray, left: np.ndarray, right: np.ndarray,
+                       ckeys: np.ndarray, vecs: dict, col: str, n_jobs: int = 1,
+                       chunk: int = 200_000) -> np.ndarray:
+    """Same values as rowwise_tfidf_cos(texts[left], texts[right], ckeys, ...), but each
+    distinct record is transformed once per vectorizer (records repeat across many pairs)
+    and the transform and the row-wise products run in forked workers."""
+    from scipy import sparse
+    out = np.full(len(left), np.nan, dtype=np.float32)
+    avail = [k for k in vecs if isinstance(k, tuple) and k[0] == col]
+    for c in np.unique(ckeys):
+        vec = vecs.get((col, c)) or (vecs[avail[0]] if avail else None)
+        if vec is None:
+            continue
+        rows = np.flatnonzero(ckeys == c)
+        idx = np.unique(np.concatenate([left[rows], right[rows]]))
+        X = sparse.vstack(fork_map(_tfidf_transform_worker, chunk_ranges(len(idx), chunk), n_jobs,
+                                   shared={"texts": texts, "idx": idx, "vec": vec}), format="csr")
+        pl, pr = np.searchsorted(idx, left[rows]), np.searchsorted(idx, right[rows])
+        parts = fork_map(_tfidf_cos_worker, chunk_ranges(len(rows), chunk), n_jobs,
+                         shared={"X": X, "pl": pl, "pr": pr})
+        out[rows] = np.concatenate(parts)
+        del X
+    return out
+
+
 def load_embeddings(tag_to_path: dict[str, str | None],
                     expected_rows: dict[str, int]) -> dict:
     """Memmap Stage-1 BGE-M3 embedding files, one per source file (tag -> .npy path; the
@@ -376,7 +413,7 @@ def _group_rank_gap(df: pd.DataFrame, key: str, col: str) -> tuple[np.ndarray, n
 
 
 def structural_features(pairs: pd.DataFrame, feats: pd.DataFrame, rec: pd.DataFrame,
-                        vecs: dict) -> pd.DataFrame:
+                        vecs: dict, n_jobs: int = 1) -> pd.DataFrame:
     """Competition context. Within-S1: list size, rank / gap-to-best on key similarities,
     top1-top2 margin, and each candidate's similarity to the S1's top-1 candidate (a
     near-duplicate of the best candidate is likely another record of the same cluster).
@@ -405,8 +442,8 @@ def structural_features(pairs: pd.DataFrame, feats: pd.DataFrame, rec: pd.DataFr
     top_p = d["q"].map(top_idx.set_index("q")["p"]).to_numpy()
     texts = rec["sparse_text"].to_numpy()
     ck = rec["ckey"].to_numpy()
-    out["sim_to_top1"] = rowwise_tfidf_cos(list(texts[d["p"].to_numpy()]), list(texts[top_p]),
-                                           ck[d["p"].to_numpy()], vecs, "sparse_text")
+    out["sim_to_top1"] = pairwise_tfidf_cos(texts, d["p"].to_numpy(), top_p,
+                                            ck[d["p"].to_numpy()], vecs, "sparse_text", n_jobs)
     out.loc[d["p"].to_numpy() == top_p, "sim_to_top1"] = np.nan  # the top-1 itself
 
     gp = d.groupby("p", sort=False)
@@ -450,11 +487,11 @@ def build_features(pairs: pd.DataFrame, rec: pd.DataFrame, vecs: dict, embs: dic
 
     st = rec["sparse_text"].to_numpy()
     nt = rec["name_text"].to_numpy()
-    feats["full_tfidf_cos"] = rowwise_tfidf_cos(list(st[qi]), list(st[pi]), ckeys[qi], vecs, "sparse_text")
-    feats["name_tfidf_cos"] = rowwise_tfidf_cos(list(nt[qi]), list(nt[pi]), ckeys[qi], vecs, "name_text")
+    feats["full_tfidf_cos"] = pairwise_tfidf_cos(st, qi, pi, ckeys[qi], vecs, "sparse_text", n_jobs)
+    feats["name_tfidf_cos"] = pairwise_tfidf_cos(nt, qi, pi, ckeys[qi], vecs, "name_text", n_jobs)
     feats["bge_m3_cos"] = rowwise_dense_cos(rec, qi, pi, embs)
 
-    feats = pd.concat([feats, structural_features(pairs, feats, rec, vecs)], axis=1)
+    feats = pd.concat([feats, structural_features(pairs, feats, rec, vecs, n_jobs)], axis=1)
     return feats[FEATURES].astype(np.float32)
 
 
