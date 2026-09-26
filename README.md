@@ -20,7 +20,7 @@ For each record in $S_1$, identify all matching records in $S_2$ and $S_3$ (zero
 
 ---
 
-## 🏗️ System Architecture (3-Stage Cascaded Pipeline)
+## 🏗️ System Architecture (4-Stage Cascaded Pipeline)
 
 ```
                             ┌────────────────────────────────────────┐
@@ -56,12 +56,20 @@ For each record in $S_1$, identify all matching records in $S_2$ and $S_3$ (zero
                                         │
                                         ▼
  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
- │ STAGE 3: TRANSFORMER CROSS-ENCODER RERANKING & THRESHOLDING                                      │
+ │ STAGE 3: TRANSFORMER CROSS-ENCODER RERANKING                                                     │
  │                                                                                                  │
  │  - DeBERTa-v3-base Cross-Encoder (Full fine-tuning or LoRA parameter-efficient adaptation).      │
  │  - Joint cross-attention: "[CLS] name1 | addr1 | country [SEP] name2 | addr2 | country [SEP]"   │
  │  - Classification head fusing deep text representations with LightGBM contextual metadata.       │
- │  - Platt probability calibration & threshold sweep optimized for F_0.5.                          │
+ │  - Platt probability calibration on a held-out dev split.                                        │
+ │  - Output: calibrated pair scores                                                                │
+ └──────────────────────────────────────┬───────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ STAGE 4: MATCH DECISION                                                                          │
+ │                                                                                                  │
+ │  - Score column / threshold / per-S1 cap chosen on val for macro F_0.5.                          │
  │  - Output: matching_results.tsv                                                                  │
  └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -75,16 +83,17 @@ For each record in $S_1$, identify all matching records in $S_2$ and $S_3$ (zero
 ├── code/
 │   └── business_entity_resolution/
 │       ├── requirements.txt            # Python environment dependencies
-│       ├── README.md                   # Stage-1 blocking specific documentation
+│       ├── README.md                   # Per-stage CLI input/output contracts
 │       └── src/
 │           ├── preprocessing.py        # Entity normalization & transliteration
 │           ├── sparse_retrieval.py     # TF-IDF inverted index & n-gram blocking
 │           ├── dense_retrieval.py      # BGE-M3 embedding generation & FAISS search
-│           ├── blocking_pipeline.py    # Stage 1 orchestration & candidate union
-│           ├── feature_engineering.py  # 50+ pairwise lexical, phonetic & dense features
-│           ├── stage2_lgbm.py          # Stage 2 LightGBM candidate ranker & filter
-│           ├── stage3_cross_encoder.py # Stage 3 DeBERTa-v3 cross-encoder
-│           ├── evaluate.py             # Candidate recall, precision & F_0.5 scorer
+│           ├── stage1_blocking.py      # Stage 1 CLI: TF-IDF fit + hybrid blocking
+│           ├── stage2_lgbm.py          # Stage 2 CLI: LightGBM candidate filter (train/predict)
+│           ├── stage3_cross_encoder.py # Stage 3 CLI: DeBERTa-v3 cross-encoder (train/score)
+│           ├── stage4_decision.py      # Stage 4 CLI: match decision rule (tune/apply)
+│           ├── feature_engineering.py  # 63 pairwise lexical, address & dense features
+│           ├── evaluate.py             # Stage-1 candidate recall & reduction ratio
 │           ├── make_subsample.py       # Relationship-preserving prototyping tool
 │           └── utils.py                # Fast TSV I/O, parallel multiprocessing utilities
 ├── Dataset/                            # Input dataset directory (ignored by git)
@@ -125,80 +134,24 @@ pip install -r code/business_entity_resolution/requirements.txt
 
 ---
 
-## 🚀 Step-by-Step Execution Workflow
+## 🚀 Execution Workflow
 
-All pipeline commands should be run from `code/business_entity_resolution/`:
+Each stage is a standalone CLI under `code/business_entity_resolution/src/` that takes
+every input and output file as an explicit argument, so any stage can be run on its own
+(including on another machine) given only its input files:
 
-```bash
-cd code/business_entity_resolution
-```
+| Stage | Command | Key inputs → outputs |
+|---|---|---|
+| 1 | `stage1_blocking.py fit-vectorizers` / `block` | source TSVs → `candidate_pairs.tsv`, detail parquet, embeddings |
+| 2 | `stage2_lgbm.py train` / `predict` | Stage-1 detail + source TSVs → filtered candidates (+ model dir) |
+| 3 | `stage3_cross_encoder.py train` / `score` | Stage-2 filtered candidates + source TSVs → pair scores (+ model dir) |
+| 4 | `stage4_decision.py tune` / `apply` | Stage-3 scores + S1 TSV → `decision.json` / `matching_results.tsv` |
 
-### 1. Rapid Prototyping (Optional)
-Create a lightweight, relationship-preserving subsample to verify the pipeline logic in seconds:
-
-```bash
-# Create subsample in cache
-python src/make_subsample.py \
-    --data-dir ../../Dataset/student_resource/dataset \
-    --out-dir ../../cache/prototype_data
-
-# Run Stage 1 blocking on prototype
-python src/blocking_pipeline.py \
-    --data-dir ../../cache/prototype_data \
-    --queries val \
-    --output-dir ../../cache/proto_out \
-    --cache-dir ../../cache/proto_cache
-```
-
-### 2. Stage 1: Hybrid Blocking & Candidate Generation
-Runs normalization, sparse TF-IDF retrieval, and dense BGE-M3 FAISS retrieval:
-
-```bash
-# Validation split candidate generation
-python src/blocking_pipeline.py --queries val
-
-# Test set candidate generation (generates output/candidate_pairs.tsv)
-python src/blocking_pipeline.py --queries test
-```
-*Key Flag:* `--no-dense` allows running purely sparse channels when GPU or embedding caches are omitted.
-
-### 3. Stage 2: LightGBM Pair Filtering
-Extracts pairwise features and trains an out-of-fold LightGBM model to prune low-probability candidate pairs:
-
-```bash
-# Generate train_split candidates for Stage-2 training
-python src/blocking_pipeline.py --queries train_split
-
-# Train LightGBM ranker with 5-fold OOF CV
-python src/stage2_lgbm.py --oof-folds 5
-```
-
-### 4. Stage 3: DeBERTa Cross-Encoder Reranking
-Fine-tunes a cross-encoder model to score and calibrate hard candidate pairs:
-
-```bash
-# (Optional) Estimate dataset sizes, sequence lengths, and throughput
-python src/stage3_cross_encoder.py --estimate-only
-
-# Fine-tune with LoRA (parameter-efficient)
-python src/stage3_cross_encoder.py --mode lora
-
-# Or fine-tune full backbone
-python src/stage3_cross_encoder.py --mode full
-```
-
-### 5. Final Output Generation & Evaluation
-Score validation performance and output final test predictions:
-
-```bash
-# Evaluate F_0.5 on held-out validation set
-python src/evaluate.py \
-    --candidates output/val_candidate_pairs.tsv \
-    --truth ../../Dataset/student_resource/dataset/val/val_ground_truth.tsv
-
-# Score test set
-python src/stage3_cross_encoder.py --score-only --model-dir output/stage3_model
-```
+The complete end-to-end command sequence and the exact input/output file contract of
+every stage are in
+[code/business_entity_resolution/README.md](code/business_entity_resolution/README.md).
+For a quick check, run the same sequence on a small subsample created with
+`src/make_subsample.py`.
 
 ---
 

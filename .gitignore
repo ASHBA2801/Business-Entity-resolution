@@ -98,3 +98,13 @@ __MACOSX/
 htmlcov/
 .tox/
 .nox/
+
+# --- Secrets & Credentials (PUBLIC REPO) ---
+*.pem
+*.key
+.env
+.env.*
+credentials
+*credentials*.json
+.aws/
+checkpoints/

@@ -21,6 +21,26 @@ def read_tsv(path: str) -> pd.DataFrame:
                        engine="pyarrow")
 
 
+def load_truth(path: str) -> dict[str, set]:
+    """Ground-truth TSV -> {source1_entity_id: set of matched ids} (empty set = singleton)."""
+    gt = read_tsv(path)
+    return {s: set(m.split(",")) - {""} for s, m in
+            zip(gt["source1_entity_id"], gt["matched_entity_ids"])}
+
+
+def require_files(*paths: str | None) -> None:
+    """Fail fast (before any heavy work) if a declared input file is missing."""
+    missing = [p for p in paths if p and not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError("missing input file(s): " + ", ".join(missing))
+
+
+def ensure_parent(path: str) -> str:
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    return path
+
+
 def rss_gb() -> float:
     return psutil.Process().memory_info().rss / 1e9
 

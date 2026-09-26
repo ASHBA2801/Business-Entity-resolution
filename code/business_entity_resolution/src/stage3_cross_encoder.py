@@ -1,17 +1,19 @@
 """Stage 3: DeBERTa-v3-base cross-encoder over Stage-2's filtered top-K pairs.
 
-Usage (from code/business_entity_resolution/):
-    # prerequisite: Stage 2 with out-of-fold training candidates
-    python src/stage2_lgbm.py --oof-folds 5
-    python src/stage3_cross_encoder.py --estimate-only     # rows, lengths, throughput, cost
-    python src/stage3_cross_encoder.py --mode lora         # fine-tune, calibrate, score val/test
-    python src/stage3_cross_encoder.py --mode full
-    python src/stage3_cross_encoder.py --score-only --model-dir <run dir>   # re-score
+Two subcommands; every input and output is an explicit path (see README for the contract):
+
+  train   Stage-2 out-of-fold filtered train_split candidates + Stage-2 filtered val
+          candidates + source TSVs + ground truth -> model dir (weights, calibration,
+          reports) + val pair scores (Stage-4 tuning input)
+  score   model dir + any Stage-2 filtered candidates TSV (e.g. test) -> pair scores
+
+    python src/stage3_cross_encoder.py train ... --estimate-only   # rows, lengths, cost
+    python src/stage3_cross_encoder.py train ... --mode lora
+    python src/stage3_cross_encoder.py score --model-dir <dir> ...
 
 Data design
-  * Training pairs = <stage2-dir>/train_split_filtered_candidates.tsv: Stage 2's top-K for
-    train_split S1, scored OUT-OF-FOLD, i.e. the same kind of hard pairs Stage 2 passes at
-    test time. Labels from train_split ground truth.
+  * Training pairs = Stage 2's top-K for train_split S1, scored OUT-OF-FOLD, i.e. the
+    same kind of hard pairs Stage 2 passes at test time. Labels from train_split truth.
   * Grouped split of the training S1s into fit / dev. Early stopping (pair-level F0.5 at
     the best threshold) and Platt calibration use dev.
   * val (disjoint S1s, filtered by the deployed Stage-2 model) is never used for training,
@@ -21,11 +23,11 @@ Input: "[CLS] name1 | address1 | country [SEP] name2 | address2 | country [SEP]"
 preprocessing.light_name / light_address (noise cleaned, abbreviations and legal forms kept
 as written), optionally fused with Stage-2 context features at the classification head.
 
-Outputs (<output-dir>/stage3_<run-name>/):
-  adapter/ (LoRA) or backbone/ (full) + head.pt + meta.json
-  cross_encoder_scores.tsv       test pairs      source1_entity_id, candidate_entity_id,
-  val_cross_encoder_scores.tsv   val pairs       raw_score, normalized_score, ...
-  stage3_report.json, stage3_val_sweep.tsv
+Model dir (written by train, read by score):
+  adapter/ (LoRA) or backbone/ (full) + head.pt + meta.json (calibration, max_len, feature
+  standardization), stage3_report.json, stage3_val_sweep.tsv, stage3_cost_estimate.json
+Scores TSV: source1_entity_id, candidate_entity_id, raw_score, normalized_score, raw_logit,
+  no_match_score, lgbm_score, lgbm_rank
 """
 
 from __future__ import annotations
@@ -43,7 +45,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from preprocessing import light_address, light_name, normalize_country  # noqa: E402
-from utils import chunk_ranges, default_n_jobs, fork_map, get_shared, read_tsv, stage  # noqa: E402
+from utils import (chunk_ranges, default_n_jobs, ensure_parent, fork_map, get_shared,  # noqa: E402
+                   load_truth, read_tsv, require_files, stage)
 
 FEATS = ["lgbm_score", "lgbm_logit", "lgbm_rank", "lgbm_gap", "n_cands", "cand_is_s3"]
 THRESHOLDS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.93, 0.95,
@@ -52,19 +55,6 @@ LORA_TARGETS = ["query_proj", "key_proj", "value_proj", "dense"]
 
 
 # =========================================================================== data
-def s1_path(data_dir, split):
-    return os.path.join(data_dir, split, f"{split}_source1.tsv")
-
-
-def load_truth(data_dir, split) -> dict[str, set] | None:
-    p = os.path.join(data_dir, split, f"{split}_ground_truth.tsv")
-    if not os.path.exists(p):
-        return None
-    gt = read_tsv(p)
-    return {s: set(m.split(",")) - {""} for s, m in
-            zip(gt["source1_entity_id"], gt["matched_entity_ids"])}
-
-
 def read_filtered(path: str) -> tuple[list[str], pd.DataFrame]:
     """Stage-2 filtered TSV -> (every S1 id in the file, one row per passed pair) with the
     Stage-2 context features of each pair."""
@@ -107,27 +97,24 @@ def load_texts(paths: list[str], ids: set, n_jobs: int) -> dict[str, str]:
     return out
 
 
-def build_split(cfg, split: str, filtered: str, pool_split: str) -> dict | None:
-    """Pairs + texts + labels for one split, or None if Stage 2 did not produce it."""
-    path = os.path.join(cfg.stage2_dir, filtered)
-    if not os.path.exists(path):
-        return None
-    all_s1, pairs = read_filtered(path)
-    truth = load_truth(cfg.data_dir, split)
+def build_split(name: str, candidates: str, s1: str, s2: str, s3: str, truth: str | None,
+                n_jobs: int) -> dict:
+    """Pairs + texts (+ labels if truth is given) for one Stage-2 filtered candidates file."""
+    require_files(candidates, s1, s2, s3, truth)
+    all_s1, pairs = read_filtered(candidates)
+    truth = load_truth(truth) if truth else None
     ids = set(pairs["s1"]) | set(pairs["cand"])
-    files = [s1_path(cfg.data_dir, split)] + [
-        os.path.join(cfg.data_dir, pool_split, f"{pool_split}_source{i}.tsv") for i in (2, 3)]
-    texts = load_texts(files, ids, cfg.n_jobs)
+    texts = load_texts([s1, s2, s3], ids, n_jobs)
     missing = ids - texts.keys()
     if missing:
-        raise ValueError(f"{split}: {len(missing)} ids in {filtered} not in source files, "
-                         f"e.g. {sorted(missing)[:3]}")
+        raise ValueError(f"{name}: {len(missing)} ids in {candidates} not in the given source "
+                         f"files, e.g. {sorted(missing)[:3]}")
     pairs["text_a"] = pairs["s1"].map(texts)
     pairs["text_b"] = pairs["cand"].map(texts)
     if truth is not None:
         pairs["label"] = np.fromiter((c in truth.get(s, ()) for s, c in
                                       zip(pairs["s1"], pairs["cand"])), np.float32, len(pairs))
-    return {"name": split, "all_s1": all_s1, "pairs": pairs, "truth": truth}
+    return {"name": name, "all_s1": all_s1, "pairs": pairs, "truth": truth}
 
 
 def grouped_fit_dev(pairs: pd.DataFrame, cfg) -> tuple[np.ndarray, np.ndarray]:
@@ -557,11 +544,14 @@ def gpu_estimate(cfg, mean_tokens: float, n_body_params: float) -> dict:
 
 
 def full_scale_rows(cfg, pairs_per_s1: dict) -> dict:
-    """Projected full-dataset pair counts = full S1 count x pairs/S1 observed here."""
+    """Projected full-dataset pair counts = full S1 count x pairs/S1 observed here.
+    Test pairs/S1 is taken from val (same Stage-2 filter)."""
     out = {}
+    full = {"train": cfg.full_train_s1, "val": cfg.full_val_s1, "test": cfg.full_test_s1}
+    pairs_per_s1 = {**pairs_per_s1, "test": pairs_per_s1.get("val")}
     for split, pps in pairs_per_s1.items():
-        p = s1_path(cfg.full_data_dir, split)
-        if os.path.exists(p) and pps is not None:
+        p = full[split]
+        if p and os.path.exists(p) and pps is not None:
             with open(p, "rb") as f:
                 n = sum(1 for _ in f) - 1
             out[split] = {"s1": n, "pairs_per_s1": round(pps, 3), "pairs": int(n * pps)}
@@ -569,10 +559,10 @@ def full_scale_rows(cfg, pairs_per_s1: dict) -> dict:
 
 
 def cost_report(cfg, rows_here, bench, gpu, full_rows) -> dict:
-    tr = full_rows.get("train_split", {}).get("pairs")
-    if cfg.max_train_s1 and "train_split" in full_rows:
-        tr = int(min(cfg.max_train_s1, full_rows["train_split"]["s1"])
-                 * full_rows["train_split"]["pairs_per_s1"])
+    tr = full_rows.get("train", {}).get("pairs")
+    if cfg.max_train_s1 and "train" in full_rows:
+        tr = int(min(cfg.max_train_s1, full_rows["train"]["s1"])
+                 * full_rows["train"]["pairs_per_s1"])
     inf = sum(full_rows.get(s, {}).get("pairs", 0) for s in ("val", "test"))
     rep = {"rows_this_run": rows_here, "measured_here": bench, "a10g_estimate": gpu,
            "full_scale_rows": full_rows}
@@ -580,7 +570,7 @@ def cost_report(cfg, rows_here, bench, gpu, full_rows) -> dict:
         lo, hi = 0.5, 1.5  # throughput uncertainty band around the analytic estimate
         dev_pairs = tr * cfg.dev_frac
         if cfg.max_dev_s1:
-            dev_pairs = min(dev_pairs, cfg.max_dev_s1 * full_rows["train_split"]["pairs_per_s1"])
+            dev_pairs = min(dev_pairs, cfg.max_dev_s1 * full_rows["train"]["pairs_per_s1"])
         fit_pairs = (tr - dev_pairs) * cfg.epochs
         h_train = fit_pairs / gpu["train_pairs_per_s"] / 3600
         h_eval = dev_pairs * cfg.evals_per_epoch * cfg.epochs / gpu["infer_pairs_per_s"] / 3600
@@ -660,34 +650,32 @@ def val_report(scored: pd.DataFrame, sp) -> dict:
 
 
 # =========================================================================== main
-def run(cfg):
+def _device(cfg):
     import torch
+    torch.set_num_threads(cfg.n_jobs)
+    return torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def run_train(cfg):
     from transformers import AutoTokenizer
 
     t_start = time.perf_counter()
-    torch.set_num_threads(cfg.n_jobs)
-    device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    run_name = cfg.run_name or (f"{cfg.mode}" + ("" if cfg.use_feats else "_textonly"))
-    out_dir = cfg.model_dir or os.path.join(cfg.output_dir, f"stage3_{run_name}")
+    require_files(cfg.train_candidates, cfg.train_s1, cfg.train_truth, cfg.val_candidates,
+                  cfg.val_s1, cfg.val_truth, cfg.s2, cfg.s3)
+    device = _device(cfg)
+    out_dir = cfg.model_dir
     os.makedirs(out_dir, exist_ok=True)
     rep = {"config": vars(cfg).copy(), "device": str(device), "run_dir": out_dir}
     tok = AutoTokenizer.from_pretrained(cfg.model_name)
 
     with stage("load Stage-2 filtered pairs + texts"):
-        tr = None if cfg.score_only else build_split(
-            cfg, cfg.train_split, f"{cfg.train_split}_filtered_candidates.tsv", "train")
-        va = build_split(cfg, cfg.eval_split, f"{cfg.eval_split}_filtered_candidates.tsv", "train")
-        te = build_split(cfg, "test", "filtered_candidates.tsv", "test") if cfg.score_test else None
-        if not cfg.score_only and tr is None:
-            raise FileNotFoundError(f"{cfg.stage2_dir}/{cfg.train_split}_filtered_candidates.tsv "
-                                    "missing: run stage2_lgbm.py --oof-folds 5")
-        for sp in (tr, va, te):
-            if sp is not None:
-                print(f"    {sp['name']}: {len(sp['all_s1']):,} S1 | {len(sp['pairs']):,} pairs | "
-                      f"{sp['pairs']['s1'].nunique():,} S1 with >=1 pair", flush=True)
-
-    if cfg.score_only:
-        return score_only(cfg, tok, device, out_dir, va, te)
+        tr = build_split("train", cfg.train_candidates, cfg.train_s1, cfg.s2, cfg.s3,
+                         cfg.train_truth, cfg.n_jobs)
+        va = build_split("val", cfg.val_candidates, cfg.val_s1, cfg.s2, cfg.s3,
+                         cfg.val_truth, cfg.n_jobs)
+        for sp in (tr, va):
+            print(f"    {sp['name']}: {len(sp['all_s1']):,} S1 | {len(sp['pairs']):,} pairs | "
+                  f"{sp['pairs']['s1'].nunique():,} S1 with >=1 pair", flush=True)
 
     # ---- class balance + grouped split -------------------------------------------------
     m_fit, m_dev = grouped_fit_dev(tr["pairs"], cfg)
@@ -743,11 +731,9 @@ def run(cfg):
         n_body = sum(p.numel() for n, p in model.named_parameters()
                      if "embeddings" not in n and "lora_" not in n)
         gpu = gpu_estimate(cfg, mean_tok, n_body)
-        pps = {cfg.train_split: len(tr["pairs"]) / max(len(tr["all_s1"]), 1),
-               cfg.eval_split: len(va["pairs"]) / max(len(va["all_s1"]), 1),
-               "test": (len(te["pairs"]) / max(len(te["all_s1"]), 1)) if te else None}
-        cost = cost_report(cfg, {"fit": len(fit_p), "dev": len(dev_p), "val": len(va["pairs"]),
-                                 "test": len(te["pairs"]) if te else 0},
+        pps = {"train": len(tr["pairs"]) / max(len(tr["all_s1"]), 1),
+               "val": len(va["pairs"]) / max(len(va["all_s1"]), 1)}
+        cost = cost_report(cfg, {"fit": len(fit_p), "dev": len(dev_p), "val": len(va["pairs"])},
                            bench, gpu, full_scale_rows(cfg, pps))
         cpu_min = (len(fit_p) * cfg.epochs / max(bench["train_pairs_per_s"], 1e-9)) / 60
         cost["this_run_estimate_min"] = round(cpu_min, 1)
@@ -772,7 +758,7 @@ def run(cfg):
     model, meta = load_trained(out_dir, device)  # best checkpoint
 
     # ---- calibrate on dev, evaluate on val -------------------------------------------------
-    with stage("calibrate (dev) + score val/test"):
+    with stage("calibrate (dev) + score val"):
         z_dev = predict(model, dev, cfg, device)
         platt = fit_platt(z_dev, dev_p["label"].to_numpy())
         f_dev, t_dev = best_pair_f05(z_dev, dev_p["label"].to_numpy())
@@ -782,38 +768,51 @@ def run(cfg):
         json.dump(meta, open(os.path.join(out_dir, "meta.json"), "w"), indent=2)
         cfg.use_feats = bool(meta["feats"])
         val_sc = score_split(model, va, cfg, tok, device, max_len, feat_mu, feat_sd, platt)
-        write_scores(os.path.join(out_dir, f"{cfg.eval_split}_cross_encoder_scores.tsv"), val_sc)
+        write_scores(ensure_parent(cfg.val_output), val_sc)
         rep["val"] = val_report(val_sc, va)
-        if te is not None:
-            te_sc = score_split(model, te, cfg, tok, device, max_len, feat_mu, feat_sd, platt)
-            write_scores(os.path.join(out_dir, "cross_encoder_scores.tsv"), te_sc)
-            rep["test"] = {"pairs": len(te_sc), "s1_with_pairs": int(te_sc["source1_entity_id"].nunique()),
-                           "mean_raw_score": round(float(te_sc["raw_score"].mean()), 4)}
+        print(f"    wrote {cfg.val_output}", flush=True)
     rep["platt"] = {"a": round(platt[0], 4), "b": round(platt[1], 4)}
     rep["dev_best"] = {"pair_f05": meta["dev_best_pair_f05"],
                        "raw_threshold": meta["dev_best_raw_threshold"]}
     rep["runtime_s"] = round(time.perf_counter() - t_start, 1)
     sweep = pd.DataFrame([{"score": k, **r} for k in ("raw_score", "normalized_score", "lgbm_score")
                           for r in rep["val"][k]])
-    sweep.to_csv(os.path.join(out_dir, f"stage3_{cfg.eval_split}_sweep.tsv"), sep="\t", index=False)
+    sweep.to_csv(os.path.join(out_dir, "stage3_val_sweep.tsv"), sep="\t", index=False)
     with open(os.path.join(out_dir, "stage3_report.json"), "w") as f:
         json.dump(rep, f, indent=2, default=float)
     print_report(rep, cfg)
     return rep
 
 
-def score_only(cfg, tok, device, out_dir, va, te):
-    model, meta = load_trained(out_dir, device)
+def run_score(cfg):
+    """Score one Stage-2 filtered candidates file with a trained model dir."""
+    from transformers import AutoTokenizer
+    t0 = time.perf_counter()
+    require_files(os.path.join(cfg.model_dir, "meta.json"), os.path.join(cfg.model_dir, "head.pt"))
+    device = _device(cfg)
+    with stage("load Stage-2 filtered pairs + texts"):
+        sp = build_split("scored", cfg.candidates, cfg.s1, cfg.s2, cfg.s3, cfg.truth, cfg.n_jobs)
+        print(f"    {len(sp['all_s1']):,} S1 | {len(sp['pairs']):,} pairs", flush=True)
+    model, meta = load_trained(cfg.model_dir, device)
+    if "platt_a" not in meta:
+        raise ValueError(f"{cfg.model_dir}/meta.json has no calibration: training did not finish")
+    tok = AutoTokenizer.from_pretrained(meta["model_cfg"]["model_name"])
     cfg.use_feats = bool(meta["feats"])
-    platt = (meta["platt_a"], meta["platt_b"])
-    for sp, name in ((va, f"{cfg.eval_split}_cross_encoder_scores.tsv"), (te, "cross_encoder_scores.tsv")):
-        if sp is None:
-            continue
-        with stage(f"score {sp['name']}"):
-            sc = score_split(model, sp, cfg, tok, device, meta["max_len"], meta["feat_mu"],
-                             meta["feat_sd"], platt)
-            write_scores(os.path.join(out_dir, name), sc)
-            print(f"    wrote {len(sc):,} pairs -> {os.path.join(out_dir, name)}")
+    with stage(f"score {len(sp['pairs']):,} pairs"):
+        sc = score_split(model, sp, cfg, tok, device, meta["max_len"], meta["feat_mu"],
+                         meta["feat_sd"], (meta["platt_a"], meta["platt_b"]))
+        write_scores(ensure_parent(cfg.output), sc)
+        print(f"    wrote {len(sc):,} pairs -> {cfg.output}", flush=True)
+    rep = {"candidates": cfg.candidates, "pairs": len(sc),
+           "s1_with_pairs": int(sc["source1_entity_id"].nunique()),
+           "mean_raw_score": round(float(sc["raw_score"].mean()), 4) if len(sc) else None,
+           "runtime_s": round(time.perf_counter() - t0, 1)}
+    if sp["truth"] is not None:
+        rep["eval"] = val_report(sc, sp)
+    if cfg.report:
+        with open(ensure_parent(cfg.report), "w") as f:
+            json.dump(rep, f, indent=2, default=float)
+    return rep
 
 
 # =========================================================================== printing
@@ -867,61 +866,85 @@ def print_report(rep, cfg):
 
 
 def parse_args(argv=None):
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, "..", "..", ".."))
-    ds = os.path.join(root, "Dataset", "student_resource", "dataset")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=ds)
-    p.add_argument("--full-data-dir", default=ds, help="full dataset, for row-count projection")
-    p.add_argument("--stage2-dir", default=os.path.join(root, "output"),
-                   help="where stage2_lgbm.py wrote *_filtered_candidates.tsv")
-    p.add_argument("--output-dir", default=os.path.join(root, "output"))
-    p.add_argument("--run-name", default=None, help="default: <mode>[_textonly]")
-    p.add_argument("--model-dir", default=None, help="run directory (default output-dir/stage3_<run>)")
-    p.add_argument("--train-split", default="train_split")
-    p.add_argument("--eval-split", default="val")
-    p.add_argument("--score-test", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--n-jobs", type=int, default=default_n_jobs())
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default=None)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--n-jobs", type=int, default=default_n_jobs())
+    common.add_argument("--device", default=None, help="default: cuda if available, else cpu")
+    common.add_argument("--eval-batch-size", type=int, default=128)
+    common.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True,
+                        help="CUDA only")
+    pool = common.add_argument_group("pool inputs (the S2/S3 files Stage 1 matched against)")
+    pool.add_argument("--s2", required=True, help="Source-2 TSV")
+    pool.add_argument("--s3", required=True, help="Source-3 TSV")
+
+    t = sub.add_parser("train", parents=[common], help="fine-tune + calibrate the cross-encoder")
+    i = t.add_argument_group("inputs")
+    i.add_argument("--train-candidates", required=True,
+                   help="Stage-2 OUT-OF-FOLD filtered candidates TSV for train_split")
+    i.add_argument("--train-s1", required=True, help="Source-1 TSV of --train-candidates")
+    i.add_argument("--train-truth", required=True, help="ground truth for --train-s1")
+    i.add_argument("--val-candidates", required=True, help="Stage-2 filtered candidates TSV for val")
+    i.add_argument("--val-s1", required=True, help="Source-1 TSV of --val-candidates")
+    i.add_argument("--val-truth", required=True, help="ground truth for --val-s1")
+    o = t.add_argument_group("outputs")
+    o.add_argument("--model-dir", required=True, help="model weights + meta + reports directory")
+    o.add_argument("--val-output", help="val pair scores TSV (Stage-4 tuning input; "
+                                        "required unless --estimate-only)")
+    c = t.add_argument_group("cost projection (optional full-size S1 files, row counts only)")
+    c.add_argument("--full-train-s1")
+    c.add_argument("--full-val-s1")
+    c.add_argument("--full-test-s1")
+    t.add_argument("--seed", type=int, default=0)
     # data
-    p.add_argument("--max-train-s1", type=int, default=0, help="subsample training S1 (0 = all)")
-    p.add_argument("--dev-frac", type=float, default=0.15)
-    p.add_argument("--max-dev-s1", type=int, default=30_000)
-    p.add_argument("--max-len", type=int, default=0, help="0 = p99.5 of pair token lengths")
-    p.add_argument("--length-sample", type=int, default=100_000)
-    p.add_argument("--use-feats", action=argparse.BooleanOptionalAction, default=True,
+    t.add_argument("--max-train-s1", type=int, default=0, help="subsample training S1 (0 = all)")
+    t.add_argument("--dev-frac", type=float, default=0.15)
+    t.add_argument("--max-dev-s1", type=int, default=30_000)
+    t.add_argument("--max-len", type=int, default=0, help="0 = p99.5 of pair token lengths")
+    t.add_argument("--length-sample", type=int, default=100_000)
+    t.add_argument("--use-feats", action=argparse.BooleanOptionalAction, default=True,
                    help="fuse Stage-2 context features at the head")
     # model / training
-    p.add_argument("--model-name", default="microsoft/deberta-v3-base")
-    p.add_argument("--mode", choices=["lora", "full"], default="lora")
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
-    p.add_argument("--lora-dropout", type=float, default=0.1)
-    p.add_argument("--lr", type=float, default=None, help="default 2e-4 (lora) / 2e-5 (full)")
-    p.add_argument("--head-lr", type=float, default=1e-3)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--eval-batch-size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--max-steps", type=int, default=0)
-    p.add_argument("--warmup", type=float, default=0.06)
-    p.add_argument("--evals-per-epoch", type=int, default=4)
-    p.add_argument("--eval-every", type=int, default=0)
-    p.add_argument("--patience", type=int, default=4, help="evals without dev F0.5 gain")
-    p.add_argument("--pos-weight", default="auto", help="'auto' = fit neg/pos (clipped), or a number")
-    p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True, help="CUDA only")
-    p.add_argument("--gradient-checkpointing", action="store_true")
+    t.add_argument("--model-name", default="microsoft/deberta-v3-base")
+    t.add_argument("--mode", choices=["lora", "full"], default="lora")
+    t.add_argument("--lora-r", type=int, default=16)
+    t.add_argument("--lora-alpha", type=int, default=32)
+    t.add_argument("--lora-dropout", type=float, default=0.1)
+    t.add_argument("--lr", type=float, default=None, help="default 2e-4 (lora) / 2e-5 (full)")
+    t.add_argument("--head-lr", type=float, default=1e-3)
+    t.add_argument("--batch-size", type=int, default=32)
+    t.add_argument("--epochs", type=int, default=3)
+    t.add_argument("--max-steps", type=int, default=0)
+    t.add_argument("--warmup", type=float, default=0.06)
+    t.add_argument("--evals-per-epoch", type=int, default=4)
+    t.add_argument("--eval-every", type=int, default=0)
+    t.add_argument("--patience", type=int, default=4, help="evals without dev F0.5 gain")
+    t.add_argument("--pos-weight", default="auto", help="'auto' = fit neg/pos (clipped), or a number")
+    t.add_argument("--gradient-checkpointing", action="store_true")
     # cost check
-    p.add_argument("--estimate-only", action="store_true")
-    p.add_argument("--score-only", action="store_true")
-    p.add_argument("--gpu-tflops", type=float, default=70.0, help="A10G peak bf16 dense (assumed)")
-    p.add_argument("--gpu-mfu", type=float, default=0.25, help="assumed utilization")
-    p.add_argument("--spot-price", type=float, default=0.45, help="g5.xlarge spot $/h (assumed)")
+    t.add_argument("--estimate-only", action="store_true")
+    t.add_argument("--gpu-tflops", type=float, default=70.0, help="A10G peak bf16 dense (assumed)")
+    t.add_argument("--gpu-mfu", type=float, default=0.25, help="assumed utilization")
+    t.add_argument("--spot-price", type=float, default=0.45, help="g5.xlarge spot $/h (assumed)")
+
+    r = sub.add_parser("score", parents=[common], help="score one filtered candidates file")
+    i = r.add_argument_group("inputs")
+    i.add_argument("--model-dir", required=True, help="directory written by train")
+    i.add_argument("--candidates", required=True, help="Stage-2 filtered candidates TSV")
+    i.add_argument("--s1", required=True, help="Source-1 TSV of --candidates")
+    i.add_argument("--truth", help="ground truth for --s1 (optional: adds evaluation)")
+    o = r.add_argument_group("outputs")
+    o.add_argument("--output", required=True, help="pair scores TSV")
+    o.add_argument("--report", help="report JSON")
     cfg = p.parse_args(argv)
-    if cfg.lr is None:
-        cfg.lr = 2e-4 if cfg.mode == "lora" else 2e-5
+    if cfg.cmd == "train":
+        if cfg.lr is None:
+            cfg.lr = 2e-4 if cfg.mode == "lora" else 2e-5
+        if not cfg.estimate_only and not cfg.val_output:
+            p.error("train: --val-output is required unless --estimate-only")
     return cfg
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    args = parse_args()
+    (run_train if args.cmd == "train" else run_score)(args)

@@ -1,9 +1,10 @@
 """Pairwise features for (Source-1 entity, candidate) pairs — Stage 2 (and reusable by 3/4).
 
-Inputs are the Stage-1 artifacts, reused rather than recomputed:
-  * <cache>/<split>_candidates_detail.parquet  per-pair channel scores / ranks
-  * <cache>/sparse_vectorizers.pkl             per-country char TF-IDF (unsupervised)
-  * <cache>/dense_<split>_<S1|S2|S3>.npy       BGE-M3 embeddings (L2-normalized, fp16)
+Inputs are the Stage-1 artifacts (explicit paths, passed in by stage2_lgbm.py), reused
+rather than recomputed:
+  * candidates detail parquet   per-pair channel scores / ranks
+  * vectorizers pickle          per-country char TF-IDF (unsupervised)
+  * embedding .npy (+ .json)    BGE-M3 embeddings per source file (L2-normalized, fp16)
     -> `bge_m3_cos` ("Feature 58"): the cosine of the cached embeddings, computed for
        EVERY candidate pair (not only the ones the dense channel retrieved).
 
@@ -321,20 +322,23 @@ def rowwise_tfidf_cos(texts_q: list[str], texts_p: list[str], ckeys: np.ndarray,
     return out
 
 
-def load_embeddings(cache_dir: str, tag_to_split: dict[str, tuple[str, str]],
+def load_embeddings(tag_to_path: dict[str, str | None],
                     expected_rows: dict[str, int]) -> dict:
-    """Memmap cached BGE-M3 embeddings. tag -> (split, source) names the cache file
-    dense_<split>_<source>.npy. A cache that is missing, incomplete or of the wrong
-    length is skipped (feature becomes NaN), never recomputed here."""
+    """Memmap Stage-1 BGE-M3 embedding files, one per source file (tag -> .npy path; the
+    .npy.json sidecar written next to it records completeness). A file that is not given,
+    missing, incomplete or of the wrong length is skipped (feature becomes NaN), never
+    recomputed here."""
     embs = {}
-    for tag, (split, src) in tag_to_split.items():
-        p = os.path.join(cache_dir, f"dense_{split}_{src}.npy")
+    for tag, p in tag_to_path.items():
+        if not p:
+            print(f"    [dense] no embedding file for {tag} -> bge_m3_cos NaN")
+            continue
         if not (os.path.exists(p) and os.path.exists(p + ".json")):
-            print(f"    [dense] missing {os.path.basename(p)} -> bge_m3_cos NaN for {tag}")
+            print(f"    [dense] missing {p} (or its .json) -> bge_m3_cos NaN for {tag}")
             continue
         meta = json.load(open(p + ".json"))
         if meta.get("done") != meta.get("n") or meta.get("n") != expected_rows[tag]:
-            print(f"    [dense] {os.path.basename(p)} incomplete/mismatched "
+            print(f"    [dense] {p} incomplete/mismatched "
                   f"(done {meta.get('done')}/{meta.get('n')}, file rows {expected_rows[tag]})")
             continue
         embs[tag] = np.load(p, mmap_mode="r")
@@ -454,6 +458,6 @@ def build_features(pairs: pd.DataFrame, rec: pd.DataFrame, vecs: dict, embs: dic
     return feats[FEATURES].astype(np.float32)
 
 
-def load_vectorizers(cache_dir: str) -> dict:
-    with open(os.path.join(cache_dir, "sparse_vectorizers.pkl"), "rb") as f:
+def load_vectorizers(path: str) -> dict:
+    with open(path, "rb") as f:
         return pickle.load(f)

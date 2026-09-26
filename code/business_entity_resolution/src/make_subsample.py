@@ -1,5 +1,5 @@
 """Build a small, relationship-preserving prototype dataset with the same layout as the
-real one, so blocking_pipeline.py runs on it unchanged (--data-dir <out-dir>).
+real one, so every stage runs on it unchanged (point the stage CLIs at <out-dir> files).
 
   val/          n_val S1 entities from val (stratified by country x singleton), + GT
   train_split/  n_train S1 entities from train_split, + GT (their matches act as

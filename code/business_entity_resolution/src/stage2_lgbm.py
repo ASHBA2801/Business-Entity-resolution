@@ -1,12 +1,12 @@
 """Stage 2: LightGBM pair scorer that filters Stage-1 candidates down to a small,
 hard top-K per Source-1 entity for the Stage-3 cross-encoder.
 
-Usage (from code/business_entity_resolution/):
-    # prerequisites: Stage 1 run with the same --cache-dir for every split used
-    python src/blocking_pipeline.py --queries train_split   # training pairs
-    python src/blocking_pipeline.py --queries val           # held-out evaluation pairs
-    python src/blocking_pipeline.py --queries test          # (optional) pairs to filter
-    python src/stage2_lgbm.py
+Two subcommands; every input and output is an explicit path (see README for the contract):
+
+  train     Stage-1 detail for a training S1 file (train_split) and an evaluation S1 file
+            (val) + source TSVs + ground truth -> model dir, filtered eval candidates,
+            out-of-fold filtered training candidates (Stage-3 training input), reports
+  predict   model dir + Stage-1 detail for any S1 file (e.g. test) -> filtered candidates
 
 Data design
   * Training pairs = Stage-1 output for train_split S1 vs the train S2/S3 pool, i.e. the
@@ -17,11 +17,9 @@ Data design
   * Features are computed over train_split + val together, so cross-S1 competition
     features see every train S1, just as they see every test S1 at inference.
 
-Outputs (--output-dir):
-  stage2_lgbm.txt                  LightGBM model   (+ stage2_meta.json: features, config)
-  val_filtered_candidates.tsv      filtered val candidates (for Stage-3 development)
-  filtered_candidates.tsv          filtered test candidates (if test Stage-1 detail exists)
-  stage2_report.json, stage2_pr_curve.png, stage2_feature_importance.tsv
+Model dir (written by train, read by predict):
+  lgbm.txt, meta.json (features, filter settings), stage2_report.json,
+  stage2_pr_curve.png, stage2_feature_importance.tsv
 """
 
 from __future__ import annotations
@@ -40,37 +38,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from feature_engineering import (DENSE_DERIVED, FEATURE_GROUPS, FEATURES,  # noqa: E402
                                  build_features, load_embeddings, load_records,
                                  load_vectorizers)
-from utils import default_n_jobs, read_tsv, stage  # noqa: E402
+from utils import (default_n_jobs, ensure_parent, load_truth, read_tsv,  # noqa: E402
+                   require_files, stage)
+
+SOURCES = ("S2", "S3")
 
 
 # =========================================================================== data
-def s1_path(data_dir, split):
-    return os.path.join(data_dir, split, f"{split}_source1.tsv")
+def build_universe(s1_sets: list[tuple], pool: dict, n_jobs: int):
+    """Records (every S1 file + pool) and the concatenated Stage-1 pair detail.
 
-
-def pool_paths(data_dir, pool_split):
-    return {s: os.path.join(data_dir, pool_split, f"{pool_split}_source{s[1]}.tsv")
-            for s in ("S2", "S3")}
-
-
-def build_universe(cfg, s1_splits: list[str], pool_split: str):
-    """Records (S1 of every split + pool) and the concatenated Stage-1 pair detail."""
-    files = {f"S1:{sp}": s1_path(cfg.data_dir, sp) for sp in s1_splits}
-    files.update(pool_paths(cfg.data_dir, pool_split))
-    rec = load_records(files, cfg.n_jobs)
+    s1_sets: [(tag, s1_tsv, s1_emb_or_None, detail_parquet)]
+    pool:    {"S2": (tsv, emb_or_None), "S3": (tsv, emb_or_None)}"""
+    files = {f"S1:{tag}": path for tag, path, _, _ in s1_sets}
+    files.update({s: pool[s][0] for s in SOURCES})
+    rec = load_records(files, n_jobs)
     rows = {t: int((rec["emb_tag"] == t).sum()) for t in files}
-    emb_map = {f"S1:{sp}": (sp, "S1") for sp in s1_splits}
-    emb_map.update({s: (pool_split, s) for s in ("S2", "S3")})
-    embs = load_embeddings(cfg.cache_dir, emb_map, rows)
+    emb_paths = {f"S1:{tag}": emb for tag, _, emb, _ in s1_sets}
+    emb_paths.update({s: pool[s][1] for s in SOURCES})
+    embs = load_embeddings(emb_paths, rows)
 
     frames = []
-    for sp in s1_splits:
-        p = os.path.join(cfg.cache_dir, f"{sp}_candidates_detail.parquet")
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"{p} missing: run blocking_pipeline.py --queries {sp} "
-                                    f"--cache-dir {cfg.cache_dir}")
-        d = pd.read_parquet(p)
-        d["split"] = sp
+    for tag, _, _, detail in s1_sets:
+        d = pd.read_parquet(detail)
+        d["split"] = tag
         frames.append(d)
     det = pd.concat(frames, ignore_index=True)
     det = det.drop(columns=[c for c in ("dense_score",) if c in det])
@@ -81,7 +72,8 @@ def build_universe(cfg, s1_splits: list[str], pool_split: str):
     det["q"] = row.reindex(det["source1_entity_id"].to_numpy()).to_numpy()
     det["p"] = row.reindex(det["candidate_entity_id"].to_numpy()).to_numpy()
     if det[["q", "p"]].isna().any().any():
-        raise ValueError("Stage-1 detail references IDs not in the source files")
+        raise ValueError("Stage-1 detail references IDs not in the given source files "
+                         "(detail built from a different S1/S2/S3?)")
     det["q"] = det["q"].astype(np.int64)
     det["p"] = det["p"].astype(np.int64)
     det["cand_is_s3"] = det["candidate_entity_id"].str.startswith("S3-").astype(np.int8)
@@ -89,10 +81,8 @@ def build_universe(cfg, s1_splits: list[str], pool_split: str):
     return rec, det, embs
 
 
-def load_truth(data_dir, split) -> dict[str, set]:
-    gt = read_tsv(os.path.join(data_dir, split, f"{split}_ground_truth.tsv"))
-    return {s: set(m.split(",")) - {""} for s, m in
-            zip(gt["source1_entity_id"], gt["matched_entity_ids"])}
+def s1_ids(path: str) -> list[str]:
+    return read_tsv(path)["entity_id"].tolist()
 
 
 def label_pairs(det: pd.DataFrame, truth: dict) -> np.ndarray:
@@ -308,25 +298,34 @@ def plot_pr(path, val_tab, val_scores, val_labels, n_true_total, chosen_t):
 
 
 # =========================================================================== main
-def run(cfg):
+def pool_arg(cfg) -> dict:
+    return {s: (getattr(cfg, s.lower()), getattr(cfg, f"{s.lower()}_emb")) for s in SOURCES}
+
+
+def run_train(cfg):
     t0 = time.perf_counter()
     rep = {"config": vars(cfg).copy()}
     thresholds = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    require_files(cfg.train_s1, cfg.train_detail, cfg.train_truth, cfg.eval_s1,
+                  cfg.eval_detail, cfg.eval_truth, cfg.s2, cfg.s3, cfg.vectorizers)
+    if cfg.oof_output and cfg.oof_folds < 2:
+        raise SystemExit("--oof-output needs --oof-folds >= 2")
+    os.makedirs(cfg.model_dir, exist_ok=True)
 
-    with stage("load records + Stage-1 pairs (train_split + val)"):
-        splits = [cfg.train_split, cfg.eval_split]
-        rec, det, embs = build_universe(cfg, splits, "train")
-        truth = {sp: load_truth(cfg.data_dir, sp) for sp in splits}
-        all_truth = {**truth[cfg.train_split], **truth[cfg.eval_split]}
-        det["label"] = label_pairs(det, all_truth)
-        print(f"    records {len(rec):,} | pairs {len(det):,} | dense caches {sorted(embs)}")
+    with stage("load records + Stage-1 pairs (train + eval S1)"):
+        rec, det, embs = build_universe(
+            [("train", cfg.train_s1, cfg.train_s1_emb, cfg.train_detail),
+             ("eval", cfg.eval_s1, cfg.eval_s1_emb, cfg.eval_detail)], pool_arg(cfg), cfg.n_jobs)
+        truth = {"train": load_truth(cfg.train_truth), "eval": load_truth(cfg.eval_truth)}
+        det["label"] = label_pairs(det, {**truth["train"], **truth["eval"]})
+        print(f"    records {len(rec):,} | pairs {len(det):,} | embeddings {sorted(embs)}")
 
     with stage("features"):
-        X = build_features(det, rec, load_vectorizers(cfg.cache_dir), embs, cfg.n_jobs)
+        X = build_features(det, rec, load_vectorizers(cfg.vectorizers), embs, cfg.n_jobs)
         print(f"    {X.shape[1]} features | NaN share bge_m3_cos "
               f"{X['bge_m3_cos'].isna().mean():.3f}")
 
-    is_tr = (det["split"] == cfg.train_split).to_numpy()
+    is_tr = (det["split"] == "train").to_numpy()
     is_ev = ~is_tr
     y = det["label"].to_numpy()
 
@@ -382,8 +381,7 @@ def run(cfg):
     imp["dense_derived"] = imp["feature"].isin(DENSE_DERIVED)
     imp = imp.sort_values("gain", ascending=False).reset_index(drop=True)
     imp["gain_rank"] = np.arange(1, len(imp) + 1)
-    os.makedirs(cfg.output_dir, exist_ok=True)
-    imp.to_csv(os.path.join(cfg.output_dir, "stage2_feature_importance.tsv"), sep="\t", index=False)
+    imp.to_csv(os.path.join(cfg.model_dir, "stage2_feature_importance.tsv"), sep="\t", index=False)
     rep["importance_by_group_pct"] = imp.groupby("group")["gain_pct"].sum().round(2).to_dict()
     rep["dense_derived_gain_pct"] = round(float(imp.loc[imp["dense_derived"], "gain_pct"].sum()), 2)
     b = imp[imp["feature"] == "bge_m3_cos"].iloc[0]
@@ -391,7 +389,7 @@ def run(cfg):
 
     # ---- thresholds on val ---------------------------------------------------------
     val_det = det[is_ev].reset_index(drop=True)
-    vtruth = truth[cfg.eval_split]
+    vtruth = truth["eval"]
     n_true_total = sum(len(t) for t in vtruth.values())
     ptab = pair_threshold_table(s_val, y[is_ev], n_true_total, thresholds)
     etab = entity_threshold_table(val_det, s_val, vtruth, thresholds)
@@ -432,61 +430,84 @@ def run(cfg):
                                  mcount.clip(upper=8).value_counts().sort_index().items()}
 
     with stage("write outputs"):
-        model.save_model(os.path.join(cfg.output_dir, "stage2_lgbm.txt"),
+        model.save_model(os.path.join(cfg.model_dir, "lgbm.txt"),
                          num_iteration=model.best_iteration)
-        with open(os.path.join(cfg.output_dir, "stage2_meta.json"), "w") as f:
+        with open(os.path.join(cfg.model_dir, "meta.json"), "w") as f:
             json.dump({"features": FEATURES, "best_iteration": model.best_iteration,
                        "top_k": cfg.top_k, "score_floor": cfg.score_floor,
-                       "no_match_threshold": cfg.no_match_threshold}, f, indent=2)
-        vs1 = read_tsv(s1_path(cfg.data_dir, cfg.eval_split))["entity_id"].tolist()
-        write_filtered(os.path.join(cfg.output_dir, f"{cfg.eval_split}_filtered_candidates.tsv"), fd, vs1)
-        plot_pr(os.path.join(cfg.output_dir, "stage2_pr_curve.png"), ptab, s_val, y[is_ev],
+                       "no_match_threshold": cfg.no_match_threshold,
+                       "trained_with_embeddings": sorted(embs)}, f, indent=2)
+        write_filtered(ensure_parent(cfg.eval_output), fd, s1_ids(cfg.eval_s1))
+        plot_pr(os.path.join(cfg.model_dir, "stage2_pr_curve.png"), ptab, s_val, y[is_ev],
                 n_true_total, cfg.no_match_threshold)
+        print(f"    wrote {cfg.model_dir}/lgbm.txt, {cfg.eval_output}")
 
-    # ---- out-of-fold train_split candidates (Stage-3 training pairs) ------------------
-    if cfg.oof_folds > 1:
-        with stage(f"out-of-fold filtered candidates for {cfg.train_split}"):
+    # ---- out-of-fold training candidates (Stage-3 training pairs) ----------------------
+    if cfg.oof_output:
+        with stage(f"out-of-fold filtered candidates ({cfg.oof_folds} folds)"):
             s_oof = oof_scores(X, y, s1col, is_tr, m_fit, m_es, model, cfg)
             tr_det = det[is_tr].reset_index(drop=True)
             ofd = filter_candidates(tr_det, s_oof, cfg.top_k, cfg.score_floor, cfg.no_match_threshold)
-            ts1 = read_tsv(s1_path(cfg.data_dir, cfg.train_split))["entity_id"].tolist()
-            write_filtered(os.path.join(cfg.output_dir, f"{cfg.train_split}_filtered_candidates.tsv"),
-                           ofd, ts1)
+            write_filtered(ensure_parent(cfg.oof_output), ofd, s1_ids(cfg.train_s1))
             # should match the val filter stats if OOF scores mimic the deployed model
-            rep["oof_train_split"] = {"folds": cfg.oof_folds,
-                                      "average_precision": round(average_precision(y[is_tr], s_oof), 4),
-                                      **filter_stats(ofd, truth[cfg.train_split])}
-            print(f"    OOF AP {rep['oof_train_split']['average_precision']} "
+            rep["oof_train"] = {"folds": cfg.oof_folds,
+                                "average_precision": round(average_precision(y[is_tr], s_oof), 4),
+                                **filter_stats(ofd, truth["train"])}
+            print(f"    OOF AP {rep['oof_train']['average_precision']} "
                   f"(val AP {rep['val_average_precision']}) | "
-                  f"{rep['oof_train_split']['avg_pairs_per_s1']} pairs/S1 "
-                  f"(val {rep['filter_chosen']['avg_pairs_per_s1']})")
-
-    # ---- apply to test ---------------------------------------------------------------
-    tdet_path = os.path.join(cfg.cache_dir, "test_candidates_detail.parquet")
-    if cfg.apply_test and os.path.exists(tdet_path):
-        with stage("apply to test"):
-            del X
-            trec, tdet, tembs = build_universe(cfg, ["test"], "test")
-            TX = build_features(tdet, trec, load_vectorizers(cfg.cache_dir), tembs, cfg.n_jobs)
-            ts = model.predict(TX, num_iteration=model.best_iteration)
-            tfd = filter_candidates(tdet, ts, cfg.top_k, cfg.score_floor, cfg.no_match_threshold)
-            ts1 = read_tsv(s1_path(cfg.data_dir, "test"))["entity_id"].tolist()
-            out = os.path.join(cfg.output_dir, "filtered_candidates.tsv")
-            write_filtered(out, tfd, ts1)
-            kept = tfd[tfd["keep"]]
-            ck = trec["ckey"].to_numpy()[tdet["q"].to_numpy()]
-            rep["test"] = {"n_s1": len(ts1), "pairs_in": int(len(tdet)),
-                           "pairs_passed": int(len(kept)),
-                           "likely_no_match_s1": int(len(ts1) - kept["s1"].nunique()),
-                           "mean_score_by_country": pd.Series(ts).groupby(ck).mean().round(4).to_dict(),
-                           "output": out}
-    elif cfg.apply_test:
-        print(f"    (no {tdet_path}; skipping test filtering)")
+                  f"{rep['oof_train']['avg_pairs_per_s1']} pairs/S1 "
+                  f"(val {rep['filter_chosen']['avg_pairs_per_s1']}) -> {cfg.oof_output}")
 
     rep["runtime_s"] = round(time.perf_counter() - t0, 1)
-    with open(os.path.join(cfg.output_dir, "stage2_report.json"), "w") as f:
+    with open(os.path.join(cfg.model_dir, "stage2_report.json"), "w") as f:
         json.dump(rep, f, indent=2, default=float)
     print_report(rep, imp)
+    return rep
+
+
+def run_predict(cfg):
+    """Score + filter the Stage-1 candidates of one S1 file with a trained model dir."""
+    import lightgbm as lgb
+    t0 = time.perf_counter()
+    mpath, meta_path = (os.path.join(cfg.model_dir, f) for f in ("lgbm.txt", "meta.json"))
+    require_files(mpath, meta_path, cfg.s1, cfg.detail, cfg.s2, cfg.s3, cfg.vectorizers, cfg.truth)
+    meta = json.load(open(meta_path))
+    if meta["features"] != FEATURES:
+        raise ValueError(f"{meta_path}: model features differ from this code's FEATURES")
+    top_k = cfg.top_k if cfg.top_k is not None else meta["top_k"]
+    floor = cfg.score_floor if cfg.score_floor is not None else meta["score_floor"]
+    no_match = cfg.no_match_threshold if cfg.no_match_threshold is not None else meta["no_match_threshold"]
+
+    with stage("load records + Stage-1 pairs"):
+        rec, det, embs = build_universe([("q", cfg.s1, cfg.s1_emb, cfg.detail)], pool_arg(cfg),
+                                        cfg.n_jobs)
+        if meta.get("trained_with_embeddings") and len(embs) < 3:
+            print("    WARNING: model was trained with BGE-M3 embeddings but not all of "
+                  "--s1-emb/--s2-emb/--s3-emb are usable here; bge_m3_cos will be NaN", flush=True)
+    with stage("features + score"):
+        X = build_features(det, rec, load_vectorizers(cfg.vectorizers), embs, cfg.n_jobs)
+        scores = lgb.Booster(model_file=mpath).predict(X)
+    with stage("filter + write"):
+        fd = filter_candidates(det, scores, top_k, floor, no_match)
+        ids = s1_ids(cfg.s1)
+        write_filtered(ensure_parent(cfg.output), fd, ids)
+    kept = fd[fd["keep"]]
+    ck = rec["ckey"].to_numpy()[det["q"].to_numpy()]
+    rep = {"s1": cfg.s1, "n_s1": len(ids), "pairs_in": int(len(det)),
+           "pairs_passed": int(len(kept)),
+           "likely_no_match_s1": int(len(ids) - kept["s1"].nunique()),
+           "filter": {"top_k": top_k, "score_floor": floor, "no_match_threshold": no_match},
+           "mean_score_by_country": pd.Series(scores).groupby(ck).mean().round(4).to_dict(),
+           "output": cfg.output}
+    if cfg.truth:
+        truth = load_truth(cfg.truth)
+        rep["average_precision"] = round(average_precision(label_pairs(det, truth), scores), 4)
+        rep["filter_stats"] = filter_stats(fd, truth)
+    rep["runtime_s"] = round(time.perf_counter() - t0, 1)
+    if cfg.report:
+        with open(ensure_parent(cfg.report), "w") as f:
+            json.dump(rep, f, indent=2, default=float)
+    print(json.dumps(rep, indent=2, default=float), flush=True)
     return rep
 
 
@@ -528,44 +549,74 @@ def print_report(rep, imp):
           f"Stage-2 filter (+{lt['lost_at_stage1']} already lost at Stage 1) "
           f"out of {lt['matched_entities']} S1 with >=1 true match")
     print(f"val true matches per S1 (8 = 8+): {rep['val_matches_per_s1']}")
-    if "test" in rep:
-        print(f"TEST: {rep['test']}")
     print(f"runtime {rep['runtime_s']}s\n" + "=" * 78, flush=True)
 
 
 def parse_args(argv=None):
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, "..", "..", ".."))
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=os.path.join(root, "Dataset", "student_resource", "dataset"))
-    p.add_argument("--output-dir", default=os.path.join(root, "output"))
-    p.add_argument("--cache-dir", default=os.path.join(root, "cache"))
-    p.add_argument("--train-split", default="train_split")
-    p.add_argument("--eval-split", default="val")
-    p.add_argument("--n-jobs", type=int, default=default_n_jobs())
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--max-train-s1", type=int, default=0, help="subsample training S1 (0 = all)")
-    p.add_argument("--es-frac", type=float, default=0.15, help="grouped early-stopping holdout")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--n-jobs", type=int, default=default_n_jobs())
+    pool = common.add_argument_group("pool inputs (the S2/S3 files Stage 1 matched against)")
+    pool.add_argument("--s2", required=True, help="Source-2 TSV")
+    pool.add_argument("--s3", required=True, help="Source-3 TSV")
+    pool.add_argument("--s2-emb", help="Stage-1 BGE-M3 embeddings of --s2 (.npy; optional)")
+    pool.add_argument("--s3-emb", help="Stage-1 BGE-M3 embeddings of --s3 (.npy; optional)")
+    pool.add_argument("--vectorizers", required=True, help="Stage-1 TF-IDF vectorizers pickle")
+
+    t = sub.add_parser("train", parents=[common], help="train the LightGBM filter")
+    i = t.add_argument_group("training / evaluation inputs")
+    i.add_argument("--train-s1", required=True, help="training Source-1 TSV (train_split)")
+    i.add_argument("--train-truth", required=True, help="ground truth for --train-s1")
+    i.add_argument("--train-detail", required=True, help="Stage-1 detail parquet for --train-s1")
+    i.add_argument("--train-s1-emb", help="Stage-1 embeddings of --train-s1 (optional)")
+    i.add_argument("--eval-s1", required=True, help="evaluation Source-1 TSV (val)")
+    i.add_argument("--eval-truth", required=True, help="ground truth for --eval-s1")
+    i.add_argument("--eval-detail", required=True, help="Stage-1 detail parquet for --eval-s1")
+    i.add_argument("--eval-s1-emb", help="Stage-1 embeddings of --eval-s1 (optional)")
+    o = t.add_argument_group("outputs")
+    o.add_argument("--model-dir", required=True, help="model + meta + reports directory")
+    o.add_argument("--eval-output", required=True,
+                   help="filtered candidates TSV for --eval-s1 (Stage-3 validation input)")
+    o.add_argument("--oof-output",
+                   help="out-of-fold filtered candidates TSV for --train-s1 (Stage-3 "
+                        "training input)")
+    t.add_argument("--oof-folds", type=int, default=5)
+    t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--max-train-s1", type=int, default=0, help="subsample training S1 (0 = all)")
+    t.add_argument("--es-frac", type=float, default=0.15, help="grouped early-stopping holdout")
     # model
-    p.add_argument("--lr", type=float, default=0.05)
-    p.add_argument("--num-leaves", type=int, default=63)
-    p.add_argument("--min-child-samples", type=int, default=50)
-    p.add_argument("--num-rounds", type=int, default=3000)
-    p.add_argument("--early-stopping", type=int, default=100)
-    p.add_argument("--scale-pos-weight", type=float, default=1.0)
-    p.add_argument("--ablation", action=argparse.BooleanOptionalAction, default=True)
-    # filtering
-    p.add_argument("--top-k", type=int, default=3)
-    p.add_argument("--score-floor", type=float, default=0.02)
-    p.add_argument("--no-match-threshold", type=float, default=0.05)
-    p.add_argument("--sweep-k", type=int, nargs="+", default=[1, 2, 3, 5, 8, 10])
-    p.add_argument("--sweep-floor", type=float, nargs="+", default=[0.01, 0.02, 0.05, 0.1, 0.2])
-    p.add_argument("--apply-test", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--oof-folds", type=int, default=0,
-                   help="K>1: also write out-of-fold <train-split>_filtered_candidates.tsv "
-                        "(Stage-3 training pairs)")
+    t.add_argument("--lr", type=float, default=0.05)
+    t.add_argument("--num-leaves", type=int, default=63)
+    t.add_argument("--min-child-samples", type=int, default=50)
+    t.add_argument("--num-rounds", type=int, default=3000)
+    t.add_argument("--early-stopping", type=int, default=100)
+    t.add_argument("--scale-pos-weight", type=float, default=1.0)
+    t.add_argument("--ablation", action=argparse.BooleanOptionalAction, default=True)
+    # filtering (stored in meta.json and reused by predict)
+    t.add_argument("--top-k", type=int, default=3)
+    t.add_argument("--score-floor", type=float, default=0.02)
+    t.add_argument("--no-match-threshold", type=float, default=0.05)
+    t.add_argument("--sweep-k", type=int, nargs="+", default=[1, 2, 3, 5, 8, 10])
+    t.add_argument("--sweep-floor", type=float, nargs="+", default=[0.01, 0.02, 0.05, 0.1, 0.2])
+
+    r = sub.add_parser("predict", parents=[common], help="filter one S1 file's candidates")
+    i = r.add_argument_group("inputs")
+    i.add_argument("--model-dir", required=True, help="directory written by train")
+    i.add_argument("--s1", required=True, help="Source-1 TSV")
+    i.add_argument("--detail", required=True, help="Stage-1 detail parquet for --s1")
+    i.add_argument("--s1-emb", help="Stage-1 embeddings of --s1 (optional)")
+    i.add_argument("--truth", help="ground truth for --s1 (optional: adds filter stats)")
+    o = r.add_argument_group("outputs")
+    o.add_argument("--output", required=True, help="filtered candidates TSV")
+    o.add_argument("--report", help="report JSON")
+    r.add_argument("--top-k", type=int, default=None, help="default: value in meta.json")
+    r.add_argument("--score-floor", type=float, default=None, help="default: value in meta.json")
+    r.add_argument("--no-match-threshold", type=float, default=None,
+                   help="default: value in meta.json")
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    args = parse_args()
+    (run_train if args.cmd == "train" else run_predict)(args)

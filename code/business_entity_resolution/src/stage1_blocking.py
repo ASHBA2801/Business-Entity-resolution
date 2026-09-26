@@ -1,12 +1,17 @@
 """Stage 1: hybrid (sparse TF-IDF + dense BGE-M3) blocking -> candidate_pairs.tsv.
 
-Usage (from code/business_entity_resolution/):
-    python src/blocking_pipeline.py --data-dir <dataset> --queries val   # recall eval
-    python src/blocking_pipeline.py --data-dir <dataset> --queries test  # submission file
+Two subcommands; every input and output is an explicit path (see README for the contract):
 
---queries picks the Source-1 file and the pool it is matched against:
-    val / train_split / train -> <split>_source1.tsv vs train/train_source{2,3}.tsv
-    test                      -> test/test_source1.tsv vs test/test_source{2,3}.tsv
+  fit-vectorizers   unlabeled source TSVs            -> per-country TF-IDF pickle
+  block             S1 + S2 + S3 TSVs + TF-IDF pickle -> candidate TSV (+ Stage-2 detail
+                    parquet, BGE-M3 embedding files, optional recall report)
+
+    python src/stage1_blocking.py fit-vectorizers --inputs <6 source TSVs> \\
+           --output vectorizers.pkl
+    python src/stage1_blocking.py block --s1 val_source1.tsv --s2 train_source2.tsv \\
+           --s3 train_source3.tsv --vectorizers vectorizers.pkl \\
+           --output val_candidate_pairs.tsv --detail-output val_candidates_detail.parquet \\
+           --s1-emb emb_val_S1.npy --s2-emb emb_train_S2.npy --s3-emb emb_train_S3.npy
 """
 
 from __future__ import annotations
@@ -26,23 +31,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from evaluate import evaluate_candidates, print_report  # noqa: E402
 from preprocessing import normalize_country, normalize_records  # noqa: E402
 from sparse_retrieval import SparseBlocker  # noqa: E402
-from utils import (STAGE_LOG, chunk_ranges, default_n_jobs, fork_map, get_shared,  # noqa: E402
-                   peak_rss_gb, read_tsv, stage)
+from utils import (STAGE_LOG, chunk_ranges, default_n_jobs, ensure_parent, fork_map,  # noqa: E402
+                   get_shared, peak_rss_gb, read_tsv, require_files, stage)
 
 SOURCES = ("S2", "S3")
-ALL_SOURCE_FILES = [f"{split}/{split}_source{i}.tsv" for split in ("train", "test")
-                    for i in (1, 2, 3)]
-
-
-def split_paths(data_dir: str, queries: str) -> dict:
-    pool_split = "test" if queries == "test" else "train"
-    gt = os.path.join(data_dir, queries, f"{queries}_ground_truth.tsv")
-    return {
-        "queries": os.path.join(data_dir, queries, f"{queries}_source1.tsv"),
-        "S2": os.path.join(data_dir, pool_split, f"{pool_split}_source2.tsv"),
-        "S3": os.path.join(data_dir, pool_split, f"{pool_split}_source3.tsv"),
-        "gt": gt if os.path.exists(gt) else None,
-    }
 
 
 # --------------------------------------------------------------------------- loading
@@ -81,50 +73,42 @@ SPARSE_CHANNELS = {"sparse": ("sparse_text", "k_sparse"),       # name + address
                    "sparse_name": ("name_text", "k_sparse_name")}  # name only
 
 
-def load_or_fit_vectorizers(cfg, countries: list[str]) -> dict:
+def fit_vectorizers(cfg) -> dict:
     """One TF-IDF vocabulary/IDF per (text column, country), fitted unsupervised (no
-    labels) on a random sample of ALL source records (train + test, S1/S2/S3)."""
-    path = os.path.join(cfg.cache_dir, "sparse_vectorizers.pkl")
+    labels) on a random sample of every given source file. Pass ALL source files
+    (train + test, S1/S2/S3) so every country that blocking will meet has a vectorizer."""
     cols = [col for col, _ in SPARSE_CHANNELS.values()]
-    cache = {}
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            cache = pickle.load(f)
-        if cache.get("_signature") != _sparse_signature(cfg):
-            cache = {}
-    missing = [(col, c) for col in cols for c in countries if (col, c) not in cache]
-    if not missing:
-        return cache
     texts: dict[tuple, list[str]] = {}
-    for rel in ALL_SOURCE_FILES:
-        p = os.path.join(cfg.data_dir, rel)
-        if not os.path.exists(p):
-            continue
+    for p in cfg.inputs:
         df = read_tsv(p)
         df = df.sample(n=min(len(df), cfg.fit_sample_per_file), random_state=0)
         norm = normalize_frame(df, cfg.n_jobs, need_dense=False)
         for c, grp in norm.groupby("ckey"):
             for col in cols:
                 texts.setdefault((col, c), []).extend(grp[col].tolist())
-        print(f"    fit corpus: +{len(df):,} rows from {rel}", flush=True)
-    for col, c in missing:
-        docs = texts.get((col, c)) or texts.get((col, ""), [])
-        if not docs:  # country unseen everywhere: fit on all countries
-            docs = [t for (cl, _), v in texts.items() if cl == col for t in v]
+        print(f"    fit corpus: +{len(df):,} rows from {p}", flush=True)
+    vecs = {}
+    for (col, c), docs in sorted(texts.items()):
         blk = SparseBlocker(ngram_range=cfg.ngram_range, min_df=cfg.min_df).fit(docs)
-        cache[(col, c)] = blk.vectorizer
+        vecs[(col, c)] = blk.vectorizer
         print(f"    fitted TF-IDF [{col}] for '{c}': {len(docs):,} docs, "
               f"vocab {len(blk.vectorizer.vocabulary_):,}", flush=True)
-    cache["_signature"] = _sparse_signature(cfg)
-    os.makedirs(cfg.cache_dir, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(cache, f)
-    return cache
+    vecs["_meta"] = {"inputs": [os.path.basename(p) for p in cfg.inputs],
+                     "ngram_range": list(cfg.ngram_range), "min_df": cfg.min_df,
+                     "fit_sample_per_file": cfg.fit_sample_per_file,
+                     "countries": sorted({c for _, c in texts})}
+    return vecs
 
 
-def _sparse_signature(cfg) -> str:
-    return (f"{os.path.abspath(cfg.data_dir)}|{cfg.ngram_range}|{cfg.min_df}|"
-            f"{cfg.fit_sample_per_file}|{sorted(SPARSE_CHANNELS.items())}")
+def load_vectorizers(path: str, countries: list[str]) -> dict:
+    with open(path, "rb") as f:
+        vecs = pickle.load(f)
+    missing = sorted({c for col, _ in SPARSE_CHANNELS.values() for c in countries
+                      if (col, c) not in vecs})
+    if missing:
+        raise ValueError(f"{path} has no TF-IDF vectorizer for countries {missing}: re-run "
+                         "fit-vectorizers with a source file that contains them")
+    return vecs
 
 
 def run_sparse(cfg, q: pd.DataFrame, pools: dict, countries: list[str], channel: str,
@@ -154,19 +138,20 @@ def run_sparse(cfg, q: pd.DataFrame, pools: dict, countries: list[str], channel:
 
 
 # --------------------------------------------------------------------------- dense
-def run_dense(cfg, q: pd.DataFrame, pools: dict, countries: list[str], tag: str) -> list[tuple]:
+def run_dense(cfg, q: pd.DataFrame, pools: dict, countries: list[str]) -> list[tuple]:
     from dense_retrieval import DenseBlocker  # lazy: imports torch
     blk = DenseBlocker(model_name=cfg.dense_model, batch_size=cfg.dense_batch_size,
                        max_seq_length=cfg.dense_max_len, k=cfg.k_dense,
                        n_threads=cfg.n_jobs, nprobe=cfg.nprobe)
-    os.makedirs(cfg.cache_dir, exist_ok=True)
     emb = {}
-    for name, df, split in [("S1", q, tag)] + [(s, pools[s], cfg.pool_split) for s in SOURCES]:
+    emb_paths = {"S1": cfg.s1_emb, "S2": cfg.s2_emb, "S3": cfg.s3_emb}
+    for name, df in [("S1", q)] + [(s, pools[s]) for s in SOURCES]:
         t0 = time.perf_counter()
-        emb[name] = blk.encode(df["dense_text"].tolist(),
-                               cache_path=os.path.join(cfg.cache_dir, f"dense_{split}_{name}.npy"))
-        print(f"    encoded {name} ({split}): {len(df):,} texts in "
-              f"{time.perf_counter() - t0:.1f}s", flush=True)
+        path = emb_paths[name] and ensure_parent(emb_paths[name])
+        emb[name] = blk.encode(df["dense_text"].tolist(), cache_path=path)
+        print(f"    encoded {name}: {len(df):,} texts in {time.perf_counter() - t0:.1f}s"
+              + (f" -> {path}" if path else " (not saved: no --{}-emb)".format(name.lower())),
+              flush=True)
     out = []
     for c in countries:
         qi = partition_rows(q["ckey"].to_numpy(), c)
@@ -226,32 +211,49 @@ def write_candidates(path: str, q_ids: np.ndarray, pool_ids: np.ndarray, pairs: 
 
 
 # --------------------------------------------------------------------------- main
-def run(cfg) -> dict:
+def run_fit(cfg) -> dict:
+    require_files(*cfg.inputs)
+    with stage("fit TF-IDF vectorizers"):
+        vecs = fit_vectorizers(cfg)
+    tmp = ensure_parent(cfg.output) + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(vecs, f)
+    os.replace(tmp, cfg.output)
+    print(f"    wrote {cfg.output} ({len(vecs) - 1} vectorizers, countries "
+          f"{vecs['_meta']['countries']})", flush=True)
+    return vecs["_meta"]
+
+
+def run_block(cfg) -> dict:
     t_start = time.perf_counter()
-    paths = split_paths(cfg.data_dir, cfg.queries)
-    cfg.pool_split = "test" if cfg.queries == "test" else "train"
     use_dense = not cfg.no_dense
     use_sparse = not cfg.no_sparse
+    if not (use_dense or use_sparse):
+        raise SystemExit("--no-dense and --no-sparse together leave no retrieval channel")
+    require_files(cfg.s1, cfg.s2, cfg.s3, cfg.truth, cfg.vectorizers if use_sparse else None)
+    if use_sparse and not cfg.vectorizers:
+        raise SystemExit("--vectorizers is required unless --no-sparse")
 
     with stage("load + normalize"):
-        q = normalize_frame(read_tsv(paths["queries"]), cfg.n_jobs, use_dense)
-        pools = {s: normalize_frame(read_tsv(paths[s]), cfg.n_jobs, use_dense) for s in SOURCES}
+        q = normalize_frame(read_tsv(cfg.s1), cfg.n_jobs, use_dense)
+        pools = {s: normalize_frame(read_tsv(getattr(cfg, s.lower())), cfg.n_jobs, use_dense)
+                 for s in SOURCES}
         countries = sorted(c for c in set(q["ckey"]) if c) or [""]
         print(f"    queries {len(q):,} | S2 {len(pools['S2']):,} | S3 {len(pools['S3']):,} | "
               f"countries {countries}", flush=True)
 
     channels = {}
     if use_sparse:
-        with stage("fit/load TF-IDF vectorizers"):
-            vecs = load_or_fit_vectorizers(cfg, countries)
+        with stage("load TF-IDF vectorizers"):
+            vecs = load_vectorizers(cfg.vectorizers, countries)
         for ch in SPARSE_CHANNELS:
             if ch == "sparse_name" and cfg.k_sparse_name <= 0:
                 continue
-            with stage(f"{ch} retrieval (TF-IDF char {cfg.ngram_range})"):
+            with stage(f"{ch} retrieval (TF-IDF char n-grams)"):
                 channels[ch] = run_sparse(cfg, q, pools, countries, ch, vecs)
     if use_dense:
         with stage("dense retrieval (BGE-M3 + FAISS)"):
-            channels["dense"] = run_dense(cfg, q, pools, countries, tag=cfg.queries)
+            channels["dense"] = run_dense(cfg, q, pools, countries)
 
     with stage("combine + write"):
         n_s2 = len(pools["S2"])
@@ -259,76 +261,95 @@ def run(cfg) -> dict:
         pool_ids = np.concatenate([pools["S2"]["entity_id"].to_numpy(),
                                    pools["S3"]["entity_id"].to_numpy()]).astype(object)
         q_ids = q["entity_id"].to_numpy().astype(object)
-        os.makedirs(cfg.output_dir, exist_ok=True)
-        name = "candidate_pairs.tsv" if cfg.queries == "test" else f"{cfg.queries}_candidate_pairs.tsv"
-        out_path = os.path.join(cfg.output_dir, name)
-        write_candidates(out_path, q_ids, pool_ids, pairs)
-        if cfg.save_detail:
+        write_candidates(ensure_parent(cfg.output), q_ids, pool_ids, pairs)
+        print(f"    wrote {cfg.output}", flush=True)
+        if cfg.detail_output:
             detail = pairs.assign(source1_entity_id=q_ids[pairs["q"].to_numpy()],
                                   candidate_entity_id=pool_ids[pairs["p"].to_numpy()])
-            detail.drop(columns=["q", "p"]).to_parquet(
-                os.path.join(cfg.cache_dir, f"{cfg.queries}_candidates_detail.parquet"),
-                index=False)
-        print(f"    wrote {out_path}", flush=True)
+            detail.drop(columns=["q", "p"]).to_parquet(ensure_parent(cfg.detail_output),
+                                                       index=False)
+            print(f"    wrote {cfg.detail_output}", flush=True)
 
-    report = {"queries": cfg.queries, "n_s1": len(q), "n_s2": n_s2, "n_s3": len(pools["S3"]),
-              "n_candidate_pairs": int(len(pairs)),
+    report = {"queries": os.path.basename(cfg.s1), "n_s1": len(q), "n_s2": n_s2,
+              "n_s3": len(pools["S3"]), "n_candidate_pairs": int(len(pairs)),
               "avg_candidates_per_s1": round(len(pairs) / max(len(q), 1), 2),
               "s1_with_no_candidates": int(len(q) - pairs["q"].nunique()),
-              "output": out_path}
-    if paths["gt"]:
+              "output": cfg.output}
+    if cfg.truth:
         with stage("evaluate recall"):
             report["eval"] = evaluate_candidates(
-                pairs=pairs, q=q, pools=pools, gt_path=paths["gt"],
-                channels=list(channels))
+                pairs=pairs, q=q, pools=pools, gt_path=cfg.truth, channels=list(channels))
     report["total_runtime_s"] = round(time.perf_counter() - t_start, 1)
     report["peak_rss_gb"] = round(peak_rss_gb(), 2)
     report["stages"] = STAGE_LOG
     report["config"] = {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(cfg).items()}
-    with open(os.path.join(cfg.output_dir, f"blocking_report_{cfg.queries}.json"), "w") as f:
-        json.dump(report, f, indent=2)
+    if cfg.report:
+        with open(ensure_parent(cfg.report), "w") as f:
+            json.dump(report, f, indent=2)
     print_report(report)
     return report
 
 
 def parse_args(argv=None):
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, "..", "..", ".."))
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=os.path.join(root, "Dataset", "student_resource", "dataset"))
-    p.add_argument("--queries", default="val", choices=["val", "train_split", "train", "test"])
-    p.add_argument("--output-dir", default=os.path.join(root, "output"))
-    p.add_argument("--cache-dir", default=os.path.join(root, "cache"))
-    p.add_argument("--n-jobs", type=int, default=default_n_jobs())
+    sub = p.add_subparsers(dest="cmd", required=True)
+    tfidf = argparse.ArgumentParser(add_help=False)
+    tfidf.add_argument("--n-jobs", type=int, default=default_n_jobs())
+
+    f = sub.add_parser("fit-vectorizers", parents=[tfidf],
+                       help="fit per-country char TF-IDF on unlabeled source files")
+    io = f.add_argument_group("inputs / outputs")
+    io.add_argument("--inputs", nargs="+", required=True,
+                    help="source TSVs to fit on (entity_id, business_name, business_address, "
+                         "country); pass all 6 train+test S1/S2/S3 files")
+    io.add_argument("--output", required=True, help="vectorizers pickle to write")
+    f.add_argument("--ngram-range", type=int, nargs=2, default=(2, 4))
+    f.add_argument("--min-df", type=int, default=2)
+    f.add_argument("--fit-sample-per-file", type=int, default=150_000,
+                   help="rows sampled from each input file")
+
+    b = sub.add_parser("block", parents=[tfidf], help="generate candidates for one S1 file")
+    i = b.add_argument_group("inputs")
+    i.add_argument("--s1", required=True, help="Source-1 TSV (the queries)")
+    i.add_argument("--s2", required=True, help="Source-2 pool TSV")
+    i.add_argument("--s3", required=True, help="Source-3 pool TSV")
+    i.add_argument("--vectorizers", help="pickle from fit-vectorizers (required unless --no-sparse)")
+    i.add_argument("--truth", help="ground-truth TSV for S1 (optional: adds recall report)")
+    o = b.add_argument_group("outputs")
+    o.add_argument("--output", required=True, help="candidate_pairs TSV")
+    o.add_argument("--detail-output",
+                   help="per-pair channel scores/ranks parquet (Stage-2 input)")
+    o.add_argument("--report", help="blocking report JSON")
+    e = b.add_argument_group("embedding files (read if complete, else encoded + written; "
+                             "resumable; Stage-2 input)")
+    e.add_argument("--s1-emb")
+    e.add_argument("--s2-emb")
+    e.add_argument("--s3-emb")
     # sparse
-    p.add_argument("--k-sparse", type=int, default=20, help="top-K per source (S2 and S3)")
-    p.add_argument("--k-sparse-name", type=int, default=10,
+    b.add_argument("--k-sparse", type=int, default=20, help="top-K per source (S2 and S3)")
+    b.add_argument("--k-sparse-name", type=int, default=10,
                    help="top-K per source for the name-only TF-IDF channel (0 disables)")
-    p.add_argument("--ngram-range", type=int, nargs=2, default=(2, 4))
-    p.add_argument("--min-df", type=int, default=2)
-    p.add_argument("--top-features", type=int, default=48,
+    b.add_argument("--top-features", type=int, default=48,
                    help="n-grams kept per record (token-blocking prune)")
-    p.add_argument("--max-df-frac", type=float, default=0.02,
+    b.add_argument("--max-df-frac", type=float, default=0.02,
                    help="drop n-grams whose posting list exceeds this fraction of the pool")
-    p.add_argument("--fit-sample-per-file", type=int, default=150_000,
-                   help="rows sampled from each of the 6 source files to fit TF-IDF")
-    p.add_argument("--max-work-per-chunk", type=float, default=10e6,
+    b.add_argument("--max-work-per-chunk", type=float, default=10e6,
                    help="posting-list work per search chunk (bounds per-worker memory)")
     # dense
-    p.add_argument("--k-dense", type=int, default=20, help="top-K per source (S2 and S3)")
-    p.add_argument("--dense-model", default="BAAI/bge-m3")
-    p.add_argument("--dense-batch-size", type=int, default=64)
-    p.add_argument("--dense-max-len", type=int, default=64)
-    p.add_argument("--nprobe", type=int, default=32)
+    b.add_argument("--k-dense", type=int, default=20, help="top-K per source (S2 and S3)")
+    b.add_argument("--dense-model", default="BAAI/bge-m3")
+    b.add_argument("--dense-batch-size", type=int, default=64)
+    b.add_argument("--dense-max-len", type=int, default=64)
+    b.add_argument("--nprobe", type=int, default=32)
     # switches
-    p.add_argument("--no-dense", action="store_true")
-    p.add_argument("--no-sparse", action="store_true")
-    p.add_argument("--save-detail", action=argparse.BooleanOptionalAction, default=True,
-                   help="save per-candidate channel scores/ranks parquet (Stage-2 features)")
+    b.add_argument("--no-dense", action="store_true")
+    b.add_argument("--no-sparse", action="store_true")
     cfg = p.parse_args(argv)
-    cfg.ngram_range = tuple(cfg.ngram_range)
+    if cfg.cmd == "fit-vectorizers":
+        cfg.ngram_range = tuple(cfg.ngram_range)
     return cfg
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    args = parse_args()
+    (run_fit if args.cmd == "fit-vectorizers" else run_block)(args)
