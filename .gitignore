@@ -1,0 +1,100 @@
+# ==============================================================================
+# ML Challenge 2026 — Business Entity Resolution (.gitignore)
+# ==============================================================================
+
+# --- Raw & Processed Datasets (DO NOT COMMIT) ---
+Dataset/
+dataset/
+prototype_data/
+*.tsv
+*.csv
+
+# --- Cache and Intermediate Computation Artifacts ---
+cache/
+proto_cache/
+proto_cache_sp/
+proto_out/
+proto_out_sp/
+*.npy
+*.npy.json
+*.npz
+*.parquet
+*.pkl
+*.pickle
+
+# --- Pipeline Outputs & Submission Files ---
+output/
+*.log
+
+# --- Model Checkpoints & Pretrained Weights ---
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.joblib
+stage2_lgbm.txt
+stage2_meta.json
+stage3_*/
+
+# --- Python Environment & Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# --- IDEs & Code Editors ---
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+
+# --- Operating System Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+__MACOSX/
+
+# --- Testing & Linting Caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
