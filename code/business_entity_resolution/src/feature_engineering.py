@@ -412,6 +412,20 @@ def _group_rank_gap(df: pd.DataFrame, key: str, col: str) -> tuple[np.ndarray, n
     return rank, gap
 
 
+def _group_second_largest(keys: np.ndarray, vals: np.ndarray) -> np.ndarray:
+    """Per row, the second-largest value in its key group (0.0 for one-row groups): the
+    values of groupby(keys)[vals].transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1
+    else 0.0), from one sort instead of a Python call per group."""
+    order = np.lexsort((-vals, keys))
+    k, v = keys[order], vals[order]
+    first = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+    size = np.diff(np.r_[first, len(k)])
+    second = np.where(size > 1, v[np.minimum(first + 1, len(v) - 1)], 0.0)
+    out = np.empty(len(vals), dtype=np.float64)
+    out[order] = np.repeat(second, size)
+    return out
+
+
 def structural_features(pairs: pd.DataFrame, feats: pd.DataFrame, rec: pd.DataFrame,
                         vecs: dict, n_jobs: int = 1) -> pd.DataFrame:
     """Competition context. Within-S1: list size, rank / gap-to-best on key similarities,
@@ -434,8 +448,8 @@ def structural_features(pairs: pd.DataFrame, feats: pd.DataFrame, rec: pd.DataFr
     else:
         out["grp_rank_bge"] = out["grp_gap_bge"] = np.nan
     out["grp_rank_name"], out["grp_gap_name"] = _group_rank_gap(d, "q", "n")
-    top2 = gq["t"].transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1 else 0.0)
-    out["grp_margin_tfidf"] = (gq["t"].transform("max") - top2).to_numpy(np.float32)
+    top2 = _group_second_largest(d["q"].to_numpy(), d["t"].to_numpy())
+    out["grp_margin_tfidf"] = (gq["t"].transform("max").to_numpy() - top2).astype(np.float32)
 
     # similarity of each candidate to the S1's top-1 candidate (by full TF-IDF)
     top_idx = d.loc[d.groupby("q", sort=False)["t"].idxmax(), ["q", "p"]]
