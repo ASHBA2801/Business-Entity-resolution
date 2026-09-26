@@ -197,8 +197,13 @@ def _lgbm_params(cfg) -> dict:
     params = dict(objective="binary", learning_rate=cfg.lr, num_leaves=cfg.num_leaves,
                   min_child_samples=cfg.min_child_samples, feature_fraction=0.8,
                   bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  metric=["average_precision", "binary_logloss"], verbose=-1,
-                  num_threads=cfg.n_jobs, seed=cfg.seed)
+                  # early stopping follows the first metric; LightGBM computes average
+                  # precision on one core, so on very large holdouts it dominates each round
+                  metric=(["average_precision", "binary_logloss"]
+                          if getattr(cfg, "es_metric", "average_precision") == "average_precision"
+                          else ["binary_logloss"]),
+                  verbose=-1, num_threads=getattr(cfg, "lgbm_threads", 0) or cfg.n_jobs,
+                  seed=cfg.seed)
     if cfg.scale_pos_weight != 1.0:
         params["scale_pos_weight"] = cfg.scale_pos_weight
     return params
@@ -591,6 +596,10 @@ def parse_args(argv=None):
     t.add_argument("--min-child-samples", type=int, default=50)
     t.add_argument("--num-rounds", type=int, default=3000)
     t.add_argument("--early-stopping", type=int, default=100)
+    t.add_argument("--es-metric", choices=["average_precision", "binary_logloss"],
+                   default="average_precision", help="early-stopping metric on the holdout")
+    t.add_argument("--lgbm-threads", type=int, default=0,
+                   help="LightGBM threads (0 = --n-jobs, which also sets feature workers)")
     t.add_argument("--scale-pos-weight", type=float, default=1.0)
     t.add_argument("--ablation", action=argparse.BooleanOptionalAction, default=True)
     # filtering (stored in meta.json and reused by predict)
