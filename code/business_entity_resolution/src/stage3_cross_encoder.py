@@ -131,11 +131,18 @@ def grouped_fit_dev(pairs: pd.DataFrame, cfg) -> tuple[np.ndarray, np.ndarray]:
 
 
 # =========================================================================== tokens
-def tokenize(tok, pairs: pd.DataFrame, max_len: int | None) -> list[np.ndarray]:
-    enc = tok(pairs["text_a"].tolist(), pairs["text_b"].tolist(),
-              truncation="longest_first" if max_len else False, max_length=max_len,
-              return_attention_mask=False, return_token_type_ids=False)
-    return [np.asarray(x, dtype=np.int32) for x in enc["input_ids"]]
+def tokenize(tok, pairs: pd.DataFrame, max_len: int | None,
+             chunk: int = 100_000) -> list[np.ndarray]:
+    """Chunked so the tokenizer's per-token Python lists never exist for millions of pairs
+    at once (one call over the full training set exhausted a 64 GB box)."""
+    a, b = pairs["text_a"].tolist(), pairs["text_b"].tolist()
+    out = []
+    for s in range(0, len(a), chunk):
+        enc = tok(a[s:s + chunk], b[s:s + chunk],
+                  truncation="longest_first" if max_len else False, max_length=max_len,
+                  return_attention_mask=False, return_token_type_ids=False)
+        out.extend(np.asarray(x, dtype=np.int32) for x in enc["input_ids"])
+    return out
 
 
 def length_stats(tok, pairs: pd.DataFrame, n: int, seed: int) -> dict:
